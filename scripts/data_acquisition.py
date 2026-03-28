@@ -4,6 +4,8 @@ import logging
 import subprocess
 import sqlite3
 import time
+import requests
+from requests.auth import HTTPBasicAuth
 from pathlib import Path
 from typing import TypedDict, cast
 from urllib.parse import urlparse
@@ -11,11 +13,11 @@ from urllib.parse import urlparse
 import click
 import lz4.block  # pyright: ignore[reportMissingTypeStubs]
 
-# Setup basic logging to replace 'pass' in try-except blocks
+# Setup basic logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("WorkTracker")
 
 # --- Noise Filter for C++/Python Devs ---
 EXCLUDE_DIRS: set[str] = {
@@ -51,12 +53,10 @@ def get_minikube_services() -> list[str]:
             check=True,
             timeout=5,
         )
-        # Use dict[str, object] instead of Any for type safety
         raw_services: list[dict[str, object]] = json.loads(result.stdout)
         return [f"{s.get('Namespace')}/{s.get('Name')}" for s in raw_services]
     except (subprocess.SubprocessError, json.JSONDecodeError, FileNotFoundError) as e:
-        msg = f"Minikube error: {e}"
-        logger.debug(msg)
+        logger.debug(f"Minikube error: {e}")
         return []
 
 
@@ -71,8 +71,7 @@ def get_docker_status() -> list[str]:
         )
         return [line for line in result.stdout.strip().split("\n") if line]
     except Exception as e:
-        msg = f"Docker error: {e}"
-        logger.debug(msg)
+        logger.debug(f"Docker error: {e}")
         return []
 
 
@@ -143,7 +142,6 @@ def get_active_dev_tools() -> list[str]:
 def get_firefox_context() -> dict[str, list[str]]:
     """Extracts open tabs from Firefox session store."""
     home = Path.home()
-    # Search for recovery file
     files = list(
         (home / ".mozilla/firefox").glob("*/sessionstore-backups/recovery.jsonlz4")
     )
@@ -156,15 +154,15 @@ def get_firefox_context() -> dict[str, list[str]]:
 
     try:
         with files[0].open("rb") as f:
-            _ = f.read(8)  # Skip "mozLz40" magic number (assigned to _ for Pyright)
+            f.read(8)  # Skip magic number
             decompressed_bytes: bytes = lz4.block.decompress(f.read())
             data: dict[str, object] = json.loads(decompressed_bytes.decode("utf-8"))
 
-            windows: list[dict[str, object]] = data.get("windows", [])
+            windows: list[dict[str, object]] = data.get("windows", [])  # type: ignore
             for win in windows:
-                tabs: list[dict[str, object]] = win.get("tabs", [])
+                tabs: list[dict[str, object]] = win.get("tabs", [])  # type: ignore
                 for tab in tabs:
-                    entries: list[dict[str, object]] = tab.get("entries", [])
+                    entries: list[dict[str, object]] = tab.get("entries", [])  # type: ignore
                     if entries:
                         last_entry = entries[-1]
                         url = str(last_entry.get("url", ""))
@@ -174,8 +172,7 @@ def get_firefox_context() -> dict[str, list[str]]:
                         if url:
                             domains.add(urlparse(url).netloc)
     except Exception as e:
-        msg = f"Firefox data extraction failed: {e}"
-        logger.debug(msg)
+        logger.debug(f"Firefox extraction failed: {e}")
 
     return {"titles": list(titles), "domains": list(domains)}
 
@@ -200,7 +197,6 @@ def get_focused_window_info() -> WindowInfo:
             text=True,
             check=True,
         )
-        # Parse GNOME's GVariant output
         raw_output = ast.literal_eval(result.stdout.strip())
         if not raw_output or not isinstance(raw_output, tuple):
             return default
@@ -215,8 +211,7 @@ def get_focused_window_info() -> WindowInfo:
                     "pid": cast(int | None, win.get("pid")),
                 }
     except Exception as e:
-        msg = f"GNOME Window lookup failed: {e}"
-        logger.debug(msg)
+        logger.debug(f"GNOME Window lookup failed: {e}")
 
     return default
 
@@ -227,7 +222,7 @@ def collect_snapshot() -> dict[str, object]:
     cwd = str(Path.cwd())
     fx = get_firefox_context()
 
-    return {
+    snapshot = {
         "timestamp": int(time.time()),
         "focused_app": window["cls"],
         "docker_services": get_docker_status(),
@@ -239,6 +234,10 @@ def collect_snapshot() -> dict[str, object]:
         "tmux_sessions": get_active_tmux_sessions(),
         "firefox_tabs": fx["titles"],
     }
+
+    # Success Log
+    logger.info(f"Successfully extracted snapshot for app: {snapshot['focused_app']}")
+    return snapshot
 
 
 DB_PATH = "work_activity.db"
@@ -286,9 +285,6 @@ def log_to_db(db_path: str, data: dict):
         conn.execute(query, params)
 
 
-# --- Jira Synchronization ---
-
-
 def fetch_and_store_jira_tasks(db_path: str, url: str, email: str, token: str):
     """Fetches active tasks from Jira and updates the local table."""
     jql = 'status NOT IN ("Done", "Closed", "Suspended", "Finished") AND assignee = currentUser()'
@@ -297,7 +293,6 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, email: str, token: str):
     query = {"jql": jql, "fields": "summary,status"}
 
     try:
-        # 1. Attempt the Network Request
         response = requests.get(
             api_url,
             headers={"Accept": "application/json"},
@@ -306,17 +301,13 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, email: str, token: str):
             timeout=15,
         )
 
-        # Log specific HTTP errors (401 Unauthorized, 404 Not Found, etc.)
         if response.status_code != 200:
-            logger.error(
-                f"Jira API error: Received status {response.status_code} - {response.text}"
-            )
+            logger.error(f"Jira API error: Received status {response.status_code}")
             return False
 
         response.raise_for_status()
         data = response.json()
 
-        # 2. Attempt Database Update
         with sqlite3.connect(db_path) as conn:
             conn.execute("DELETE FROM jira_tasks")
             for issue in data.get("issues", []):
@@ -335,20 +326,12 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, email: str, token: str):
             )
             conn.commit()
 
+        logger.info(f"Successfully synced {len(data.get('issues', []))} Jira tasks.")
         return True
 
-    except requests.exceptions.ConnectionError:
-        logger.error(
-            "Jira Sync Failed: Could not connect to the server. Check your internet connection."
-        )
-    except requests.exceptions.Timeout:
-        logger.error("Jira Sync Failed: The request timed out.")
-    except sqlite3.Error as e:
-        logger.error(f"Jira Sync Failed: Database error while saving tasks: {e}")
     except Exception as e:
-        logger.error(f"Jira Sync Failed: An unexpected error occurred: {e}")
-
-    return False
+        logger.error(f"Jira Sync Failed: {e}")
+        return False
 
 
 def is_sync_due(db_path: str, sync_hour: int) -> bool:
@@ -364,32 +347,55 @@ def is_sync_due(db_path: str, sync_hour: int) -> bool:
     return (time.time() >= target_time) and (last_run < target_time)
 
 
-# --- CLI Entry Point ---
-
-
 @click.command()
 @click.option("--db", default="work_activity.db", help="Path to SQLite database.")
 @click.option("--interval", "-i", default=10, help="Seconds between snapshots.")
-@click.option(
-    "--jira-url", envvar="JIRA_URL", help="Jira URL (e.g. https://site.atlassian.net)"
-)
+@click.option("--jira-url", envvar="JIRA_URL", help="Jira URL.")
 @click.option("--jira-email", envvar="JIRA_EMAIL", help="Jira account email.")
 @click.option(
     "--jira-token", envvar="JIRA_API_TOKEN", help="Jira API Token.", hide_input=True
 )
-@click.option("--sync-hour", default=17, help="Hour to sync (0-23). Default 17 (5 PM).")
+@click.option("--sync-hour", default=17, help="Hour to sync (0-23).")
 @click.option(
     "--retry-delay", default=600, help="Seconds to wait after a sync failure."
 )
 def main(db, interval, jira_url, jira_email, jira_token, sync_hour, retry_delay):
+    if jira_url is None:
+        logger.critical("Jira URL not provided. Exiting.")
+        return
+    if jira_email is None:
+        logger.critical("Jira email not provided. Exiting.")
+        return
+    if jira_token is None:
+        logger.critical("Jira API token not provided. Exiting.")
+        return
     click.secho("🖥️  ML Data Collector Active", fg="cyan", bold=True)
     init_db(db)
     next_retry_time = 0
 
+    # sync jira on startup
+
+    click.echo(f"[{time.strftime('%H:%M:%S')}] Syncing Jira...")
+    if fetch_and_store_jira_tasks(db, jira_url, jira_email, jira_token):
+        logger.info("Successfully synced Jira on startup.", fg="green")
+    else:
+        next_retry_time = now + retry_delay
+        logger.error("Failed to sync Jira on startup.", fg="red")
+
     try:
         while True:
-            snapshot = collect_snapshot()
-            log_to_db(db, snapshot)
+            try:
+                # Core data collection step
+                snapshot = collect_snapshot()
+                log_to_db(db, snapshot)
+            except Exception as e:
+                # Complete Failure Logging
+                logger.critical(
+                    f"FATAL: Critical extraction failure. Snapshot not saved: {e}",
+                    exc_info=True,
+                )
+                time.sleep(interval)
+                continue
 
             if jira_url and jira_email and jira_token:
                 now = time.time()
@@ -403,7 +409,7 @@ def main(db, interval, jira_url, jira_email, jira_token, sync_hour, retry_delay)
 
             time.sleep(interval)
     except KeyboardInterrupt:
-        click.secho("\nStopped.", fg="yellow")
+        click.secho("\nStopped by user.", fg="yellow")
 
 
 if __name__ == "__main__":
