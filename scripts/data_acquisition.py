@@ -12,7 +12,9 @@ import click
 import lz4.block  # pyright: ignore[reportMissingTypeStubs]
 
 # Setup basic logging to replace 'pass' in try-except blocks
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 # --- Noise Filter for C++/Python Devs ---
@@ -243,30 +245,25 @@ DB_PATH = "work_activity.db"
 
 
 def init_db(db_path: str):
-    """Initializes the SQLite database and creates the schema."""
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS activity_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp INTEGER,
-                focused_app TEXT,
-                cwd TEXT,
-                docker_services TEXT,
-                minikube_services TEXT,
-                active_dev_tools TEXT,
-                recent_files TEXT,
-                browser_domains TEXT,
-                tmux_sessions TEXT,
-                firefox_tabs TEXT,
+                id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp INTEGER, focused_app TEXT,
+                cwd TEXT, docker_services TEXT, minikube_services TEXT, active_dev_tools TEXT,
+                recent_files TEXT, browser_domains TEXT, tmux_sessions TEXT, firefox_tabs TEXT,
                 jira_ticket TEXT DEFAULT NULL
             )
         """)
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS jira_tasks (key TEXT PRIMARY KEY, summary TEXT, status TEXT, updated_at INTEGER)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS sync_metadata (key TEXT PRIMARY KEY, last_run INTEGER)"
+        )
         conn.commit()
 
 
 def log_to_db(db_path: str, data: dict):
-    """Inserts a single snapshot into the database."""
-    # We convert lists to JSON strings to store them in SQLite TEXT columns
     query = """
         INSERT INTO activity_logs (
             timestamp, focused_app, cwd, docker_services, minikube_services,
@@ -289,30 +286,124 @@ def log_to_db(db_path: str, data: dict):
         conn.execute(query, params)
 
 
-@click.command()
-@click.option("--db", default=DB_PATH, help="Path to SQLite database file.")
-@click.option("--interval", "-i", default=10, help="Seconds between snapshots.")
-def main(db: str, interval: int):
-    """Logs system activity to SQLite for Jira task classification."""
-    click.secho("🖥️  ML Data Collector Active", fg="cyan", bold=True)
-    click.echo(f"Storing data in: {Path(db).absolute()}")
+# --- Jira Synchronization ---
 
+
+def fetch_and_store_jira_tasks(db_path: str, url: str, email: str, token: str):
+    """Fetches active tasks from Jira and updates the local table."""
+    jql = 'status NOT IN ("Done", "Closed", "Suspended", "Finished") AND assignee = currentUser()'
+    api_url = f"{url.rstrip('/')}/rest/api/3/search"
+    auth = HTTPBasicAuth(email, token)
+    query = {"jql": jql, "fields": "summary,status"}
+
+    try:
+        # 1. Attempt the Network Request
+        response = requests.get(
+            api_url,
+            headers={"Accept": "application/json"},
+            params=query,
+            auth=auth,
+            timeout=15,
+        )
+
+        # Log specific HTTP errors (401 Unauthorized, 404 Not Found, etc.)
+        if response.status_code != 200:
+            logger.error(
+                f"Jira API error: Received status {response.status_code} - {response.text}"
+            )
+            return False
+
+        response.raise_for_status()
+        data = response.json()
+
+        # 2. Attempt Database Update
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("DELETE FROM jira_tasks")
+            for issue in data.get("issues", []):
+                conn.execute(
+                    "INSERT INTO jira_tasks (key, summary, status, updated_at) VALUES (?, ?, ?, ?)",
+                    (
+                        issue["key"],
+                        issue["fields"]["summary"],
+                        issue["fields"]["status"]["name"],
+                        int(time.time()),
+                    ),
+                )
+            conn.execute(
+                "INSERT OR REPLACE INTO sync_metadata (key, last_run) VALUES ('jira_sync', ?)",
+                (int(time.time()),),
+            )
+            conn.commit()
+
+        return True
+
+    except requests.exceptions.ConnectionError:
+        logger.error(
+            "Jira Sync Failed: Could not connect to the server. Check your internet connection."
+        )
+    except requests.exceptions.Timeout:
+        logger.error("Jira Sync Failed: The request timed out.")
+    except sqlite3.Error as e:
+        logger.error(f"Jira Sync Failed: Database error while saving tasks: {e}")
+    except Exception as e:
+        logger.error(f"Jira Sync Failed: An unexpected error occurred: {e}")
+
+    return False
+
+
+def is_sync_due(db_path: str, sync_hour: int) -> bool:
+    now = time.localtime()
+    target_time = time.mktime(
+        (now.tm_year, now.tm_mon, now.tm_mday, sync_hour, 0, 0, 0, 0, -1)
+    )
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_run FROM sync_metadata WHERE key = 'jira_sync'"
+        ).fetchone()
+        last_run = row[0] if row else 0
+    return (time.time() >= target_time) and (last_run < target_time)
+
+
+# --- CLI Entry Point ---
+
+
+@click.command()
+@click.option("--db", default="work_activity.db", help="Path to SQLite database.")
+@click.option("--interval", "-i", default=10, help="Seconds between snapshots.")
+@click.option(
+    "--jira-url", envvar="JIRA_URL", help="Jira URL (e.g. https://site.atlassian.net)"
+)
+@click.option("--jira-email", envvar="JIRA_EMAIL", help="Jira account email.")
+@click.option(
+    "--jira-token", envvar="JIRA_API_TOKEN", help="Jira API Token.", hide_input=True
+)
+@click.option("--sync-hour", default=17, help="Hour to sync (0-23). Default 17 (5 PM).")
+@click.option(
+    "--retry-delay", default=600, help="Seconds to wait after a sync failure."
+)
+def main(db, interval, jira_url, jira_email, jira_token, sync_hour, retry_delay):
+    click.secho("🖥️  ML Data Collector Active", fg="cyan", bold=True)
     init_db(db)
+    next_retry_time = 0
 
     try:
         while True:
             snapshot = collect_snapshot()
             log_to_db(db, snapshot)
 
-            # Subtle heartbeat in the console
-            current_time = time.strftime("%H:%M:%S", time.localtime())
-            click.echo(
-                f"[{current_time}] Snapshot saved (App: {snapshot['focused_app']})"
-            )
+            if jira_url and jira_email and jira_token:
+                now = time.time()
+                if is_sync_due(db, sync_hour) and now >= next_retry_time:
+                    click.echo(f"[{time.strftime('%H:%M:%S')}] Syncing Jira...")
+                    if fetch_and_store_jira_tasks(db, jira_url, jira_email, jira_token):
+                        click.secho("Done.", fg="green")
+                    else:
+                        next_retry_time = now + retry_delay
+                        click.secho(f"Failed. Retry in {retry_delay // 60}m.", fg="red")
 
             time.sleep(interval)
     except KeyboardInterrupt:
-        click.secho("\nStopping gracefully. Data is safe.", fg="yellow")
+        click.secho("\nStopped.", fg="yellow")
 
 
 if __name__ == "__main__":
