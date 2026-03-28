@@ -1,0 +1,14 @@
+[Unit]
+Description=ML Data Collector for Jira Task Classification
+After=network.target
+
+[Service]
+# Path to your python executable (use your venv path if you have one)
+ExecStart=/home/ard/prg/jira-auto-logger/venv/bin/python /home/ard/prg/jira-auto-logger/scripts/data_acquisition.py
+# The working directory where the .db file will be created
+WorkingDirectory=/home/ard/saved_data
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
