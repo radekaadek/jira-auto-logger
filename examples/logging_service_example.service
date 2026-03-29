@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 # Path to your python executable (use your venv path if you have one)
-ExecStart=/home/ard/prg/jira-auto-logger/venv/bin/python /home/ard/prg/jira-auto-logger/scripts/data_acquisition.py
+ExecStart=/home/ard/prg/jira-auto-logger/venv/bin/python /home/ard/prg/jira-auto-logger/scripts/data_acquisition.py --db /home/ard/saved_data/work_activity.db
 # The working directory where the .db file will be created
 WorkingDirectory=/home/ard/saved_data
 Restart=always
