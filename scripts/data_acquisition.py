@@ -2,6 +2,7 @@ import ast
 import json
 import logging
 import os
+import re
 import subprocess
 import sqlite3
 import sys
@@ -38,7 +39,7 @@ EXCLUDE_DIRS: set[str] = {
 EXCLUDE_FILES: set[str] = {
     "work_activity.db",
     ".zsh_history",
-    ".bash_history",  # Might as well throw this in too!
+    ".bash_history",
 }
 
 
@@ -75,6 +76,7 @@ def get_docker_status() -> list[str]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=5,
         )
         return [line for line in result.stdout.strip().split("\n") if line]
     except Exception as e:
@@ -95,6 +97,7 @@ def get_active_tmux_sessions() -> list[str]:
             capture_output=True,
             text=True,
             check=True,
+            timeout=5,
         )
         return [
             line.split(" ", 1)[1]
@@ -107,9 +110,6 @@ def get_active_tmux_sessions() -> list[str]:
 
 def get_active_cwd(pid: int | None, app_class: str) -> str:
     """Reads the precise working directory, with explicit support for Tmux."""
-
-    # 1. If we are in a terminal, ask Tmux first!
-    # Tmux runs as a detached server, so /proc/ crawling will never find it.
     if app_class.lower() in [
         "kitty",
         "alacritty",
@@ -122,18 +122,19 @@ def get_active_cwd(pid: int | None, app_class: str) -> str:
                 ["tmux", "display-message", "-p", "#{pane_current_path}"],
                 capture_output=True,
                 text=True,
-                timeout=1,
+                timeout=2,
             ).stdout.strip()
             if tmux_path and Path(tmux_path).exists():
                 return tmux_path
         except Exception:
             pass
 
-    # 2. Fallback to /proc/ tree crawling for non-tmux terminals or GUI apps (VSCode, etc.)
     if not pid:
         return str(Path.home())
 
     current_pid = str(pid)
+    known_shells = {"bash", "zsh", "fish", "sh"}
+
     try:
         while True:
             children_file = Path(f"/proc/{current_pid}/task/{current_pid}/children")
@@ -144,7 +145,20 @@ def get_active_cwd(pid: int | None, app_class: str) -> str:
             if not children:
                 break
 
-            current_pid = children[-1]
+            next_pid = None
+            for child in children:
+                try:
+                    comm = Path(f"/proc/{child}/comm").read_text().strip()
+                    if comm in known_shells:
+                        next_pid = child
+                        break
+                except OSError:
+                    continue
+
+            if not next_pid:
+                next_pid = children[0]
+
+            current_pid = next_pid
 
         return os.readlink(f"/proc/{current_pid}/cwd")
     except OSError:
@@ -159,56 +173,56 @@ def get_recent_file_activity(
 ) -> list[str]:
     """
     Walks directory to find files modified between snapshots using precise timestamps.
-    Limits depth to prevent CPU spikes and caps output to the 10 most recent files.
+    FIXED: Prevents recursive open file descriptor stacking.
     """
     path = Path(path_str)
-
-    # REMOVED: 'path == Path.home()' so it no longer skips your home directory if you are actually working there
     if not path_str or not path.exists():
         return []
 
     recent_files: list[tuple[float, str]] = []
-    base_depth = len(path.parts)
 
-    try:
-        for root, dirs, files in os.walk(path):
-            # Prune excluded directories in-place
-            dirs[:] = [d for d in dirs if d not in EXCLUDE_DIRS]
+    def scan_dir(current_path: str, depth: int):
+        if depth > 2:  # Limit depth
+            return
 
-            # Stop descending if we are more than 2 levels deep
-            current_depth = len(Path(root).parts) - base_depth
-            if current_depth >= 2:
-                dirs.clear()
+        dirs_to_scan = []
+        try:
+            # Context manager closes properly before we dive into subdirectories
+            with os.scandir(current_path) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        if entry.name not in EXCLUDE_DIRS:
+                            dirs_to_scan.append(entry.path)
+                    elif entry.is_file(follow_symlinks=False):
+                        if entry.name in EXCLUDE_FILES:
+                            continue
+                        try:
+                            stat = entry.stat()
+                            if last_time <= stat.st_mtime <= current_time:
+                                rel_path = os.path.relpath(entry.path, path_str)
+                                recent_files.append((stat.st_mtime, rel_path))
+                        except OSError:
+                            continue
+        except OSError:
+            pass
 
-            for file in files:
-                # Skip the file if it's in our ignore list
-                if file in EXCLUDE_FILES:
-                    continue
+        # Recursively scan found directories outside the open context
+        for d in dirs_to_scan:
+            scan_dir(d, depth + 1)
 
-                filepath = Path(root) / file
-                try:
-                    mtime = filepath.stat().st_mtime
-                    # Catch files modified exactly within our elapsed window
-                    if last_time <= mtime <= current_time:
-                        recent_files.append((mtime, str(filepath.relative_to(path))))
-                except (PermissionError, FileNotFoundError):
-                    continue
+    scan_dir(path_str, 0)
 
-        # Sort by modification time (newest first) and take top 10
-        recent_files.sort(key=lambda x: x[0], reverse=True)
-        return [f[1] for f in recent_files[:10]]
-
-    except Exception as e:
-        msg = f"File activity error: {e}"
-        logger.debug(msg)
-        return []
+    recent_files.sort(key=lambda x: x[0], reverse=True)
+    return [f[1] for f in recent_files[:10]]
 
 
 def get_active_dev_tools() -> list[str]:
     """Checks for running development processes."""
     watch_list = ["node", "npm", "docker", "pytest", "python", "gcc", "make", "cmake"]
     try:
-        ps_output = subprocess.check_output(["ps", "-A", "-o", "comm="], text=True)
+        ps_output = subprocess.check_output(
+            ["ps", "-A", "-o", "comm="], text=True, timeout=5
+        )
         running = set(ps_output.split())
         return [tool for tool in watch_list if tool in running]
     except Exception:
@@ -229,7 +243,9 @@ def get_firefox_context() -> dict[str, list[str]]:
     domains: set[str] = set()
 
     try:
-        with files[0].open("rb") as f:
+        latest_file = max(files, key=lambda p: p.stat().st_mtime)
+
+        with latest_file.open("rb") as f:
             f.read(8)  # Skip magic number
             decompressed_bytes: bytes = lz4.block.decompress(f.read())
             data: dict[str, object] = json.loads(decompressed_bytes.decode("utf-8"))
@@ -272,6 +288,7 @@ def get_focused_window_info() -> WindowInfo:
             capture_output=True,
             text=True,
             check=True,
+            timeout=5,
         )
         raw_output = ast.literal_eval(result.stdout.strip())
         if not raw_output or not isinstance(raw_output, tuple):
@@ -292,14 +309,27 @@ def get_focused_window_info() -> WindowInfo:
     return default
 
 
+def extract_jira_ticket(*sources: str) -> str | None:
+    """Attempts to find a Jira ticket key (e.g., PROJ-123) in the provided strings."""
+    pattern = re.compile(r"([A-Z]+-\d+)")
+    for source in sources:
+        if not source:
+            continue
+        match = pattern.search(source)
+        if match:
+            return match.group(1)
+    return None
+
+
 def collect_snapshot(last_time: float, current_time: float) -> dict[str, object]:
     """Aggregates all data into a single dictionary."""
     window = get_focused_window_info()
-
-    # 🛑 UPDATE THIS LINE:
     cwd = get_active_cwd(window["pid"], window["cls"])
-
     fx = get_firefox_context()
+    tmux = get_active_tmux_sessions()
+
+    # Attempt to extract Jira ticket from window title, directory path, or tmux sessions
+    ticket = extract_jira_ticket(window["title"], cwd, " ".join(tmux))
 
     snapshot = {
         "timestamp": int(current_time),
@@ -310,17 +340,15 @@ def collect_snapshot(last_time: float, current_time: float) -> dict[str, object]
         "active_dev_tools": get_active_dev_tools(),
         "recent_files": get_recent_file_activity(cwd, last_time, current_time),
         "browser_domains": fx["domains"],
-        "tmux_sessions": get_active_tmux_sessions(),
+        "tmux_sessions": tmux,
         "firefox_tabs": fx["titles"],
+        "jira_ticket": ticket,
     }
 
     logger.info(
         f"Successfully extracted snapshot for app: {snapshot['focused_app']} in {cwd}"
     )
     return snapshot
-
-
-DB_PATH = "work_activity.db"
 
 
 def init_db(db_path: str):
@@ -333,7 +361,6 @@ def init_db(db_path: str):
                 jira_ticket TEXT DEFAULT NULL
             )
         """)
-        # Ledger table: Append-only tracking of task state over time
         conn.execute("""
             CREATE TABLE IF NOT EXISTS jira_tasks_ledger (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -353,8 +380,9 @@ def log_to_db(db_path: str, data: dict):
     query = """
         INSERT INTO activity_logs (
             timestamp, focused_app, cwd, docker_services, minikube_services,
-            active_dev_tools, recent_files, browser_domains, tmux_sessions, firefox_tabs
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            active_dev_tools, recent_files, browser_domains, tmux_sessions, firefox_tabs,
+            jira_ticket
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     params = (
         data["timestamp"],
@@ -367,18 +395,17 @@ def log_to_db(db_path: str, data: dict):
         json.dumps(data["browser_domains"]),
         json.dumps(data["tmux_sessions"]),
         json.dumps(data["firefox_tabs"]),
+        data["jira_ticket"],
     )
     with sqlite3.connect(db_path) as conn:
         conn.execute(query, params)
 
 
-def fetch_and_store_jira_tasks(db_path: str, url: str, token: str):
+def fetch_and_store_jira_tasks(db_path: str, url: str, token: str) -> bool:
     """Fetches active tasks from Jira and appends state changes to the ledger."""
     api_url = f"{url.rstrip('/')}/rest/api/2/search"
     headers = {"Accept": "application/json", "Authorization": f"Bearer {token}"}
 
-    # Updated JQL: Catch currently active tasks AND tasks modified in the last 24h
-    # to ensure we capture the transition to "Done"
     query = {
         "jql": "assignee = currentUser() AND (status NOT IN (Done, Suspended) OR updated >= -1d)",
         "fields": "summary,status",
@@ -397,24 +424,33 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, token: str):
         data = response.json()
         now = int(time.time())
 
+        issues = data.get("issues", [])
+        if not issues:
+            return True
+
         with sqlite3.connect(db_path) as conn:
-            for issue in data.get("issues", []):
+            # FIXED: Eliminate N+1 by pre-fetching the latest states for all returned keys
+            keys = [issue["key"] for issue in issues]
+            placeholders = ",".join(["?"] * len(keys))
+
+            # Ordering by timestamp ASC means the last row processed in the comprehension is the latest state
+            cursor = conn.execute(
+                f"SELECT key, summary, status FROM jira_tasks_ledger WHERE key IN ({placeholders}) ORDER BY timestamp ASC",
+                tuple(keys),
+            )
+            latest_states = {row[0]: (row[1], row[2]) for row in cursor.fetchall()}
+
+            for issue in issues:
                 key = issue["key"]
                 summary = issue["fields"]["summary"]
                 status = issue["fields"]["status"]["name"]
 
-                # Fetch the latest known state for this task from the ledger
-                cursor = conn.execute(
-                    "SELECT summary, status FROM jira_tasks_ledger WHERE key = ? ORDER BY timestamp DESC LIMIT 1",
-                    (key,),
-                )
-                last_record = cursor.fetchone()
+                last_state = latest_states.get(key)
 
-                # Ledger logic: Only append if it's a new task, or if summary/status changed
                 if (
-                    not last_record
-                    or last_record[0] != summary
-                    or last_record[1] != status
+                    not last_state
+                    or last_state[0] != summary
+                    or last_state[1] != status
                 ):
                     conn.execute(
                         """
@@ -430,9 +466,7 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, token: str):
             )
             conn.commit()
 
-        logger.info(
-            f"Successfully synced {len(data.get('issues', []))} Jira tasks to ledger."
-        )
+        logger.info(f"Successfully synced {len(issues)} Jira tasks to ledger.")
         return True
 
     except Exception as e:
@@ -440,29 +474,23 @@ def fetch_and_store_jira_tasks(db_path: str, url: str, token: str):
         return False
 
 
-def is_sync_due(db_path: str, sync_hour: int) -> bool:
-    now = time.localtime()
-    target_time = time.mktime(
-        (now.tm_year, now.tm_mon, now.tm_mday, sync_hour, 0, 0, 0, 0, -1)
-    )
-    with sqlite3.connect(db_path) as conn:
-        row = conn.execute(
-            "SELECT last_run FROM sync_metadata WHERE key = 'jira_sync'"
-        ).fetchone()
-        last_run = row[0] if row else 0
-    return (time.time() >= target_time) and (last_run < target_time)
+def get_last_sync_time(db_path: str) -> float:
+    """Helper to initialize the in-memory cache for Jira syncs."""
+    try:
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT last_run FROM sync_metadata WHERE key = 'jira_sync'"
+            ).fetchone()
+            return float(row[0]) if row else 0.0
+    except sqlite3.OperationalError:
+        return 0.0
 
 
 @click.command()
 @click.option("--db", default="work_activity.db", help="Path to SQLite database.")
 @click.option("--interval", "-i", default=10, help="Seconds between snapshots.")
 @click.option("--jira-url", envvar="JIRA_URL", help="Jira URL.")
-@click.option(
-    "--jira-token",
-    envvar="JIRA_PAT",
-    help="Jira Personal Access Token.",
-    hide_input=True,
-)
+@click.option("--jira-token", envvar="JIRA_PAT", help="Jira Personal Access Token.")
 @click.option("--sync-hour", default=17, help="Hour to sync (0-23).")
 @click.option(
     "--retry-delay", default=600, help="Seconds to wait after a sync failure."
@@ -474,13 +502,19 @@ def main(db, interval, jira_url, jira_token, sync_hour, retry_delay):
 
     click.secho("🖥️  ML Data Collector Active", fg="cyan", bold=True)
     init_db(db)
-    next_retry_time = 0
 
-    # Sync on startup
-    click.echo(f"[{time.strftime('%H:%M:%S')}] Syncing Jira...")
-    if not fetch_and_store_jira_tasks(db, jira_url, jira_token):
-        next_retry_time = time.time() + retry_delay
-        logger.error("Failed to sync Jira on startup.")
+    next_retry_time = 0
+    last_sync_time = get_last_sync_time(db)
+
+    # Sync on startup if we haven't synced today
+    now = time.time()
+    if (now - last_sync_time) > 43200:  # 12 hours
+        click.echo(f"[{time.strftime('%H:%M:%S')}] Syncing Jira...")
+        if fetch_and_store_jira_tasks(db, jira_url, jira_token):
+            last_sync_time = time.time()
+        else:
+            next_retry_time = time.time() + retry_delay
+            logger.error("Failed to sync Jira on startup.")
 
     last_snapshot_time = time.time() - interval
 
@@ -489,28 +523,34 @@ def main(db, interval, jira_url, jira_token, sync_hour, retry_delay):
             try:
                 loop_start_time = time.time()
 
-                # Pass absolute time bounds to prevent drift
                 snapshot = collect_snapshot(last_snapshot_time, loop_start_time)
                 log_to_db(db, snapshot)
 
-                # Update the baseline for the next cycle
                 last_snapshot_time = loop_start_time
+                current_time = time.time()
 
-                now = time.time()
-                if is_sync_due(db, sync_hour) and now >= next_retry_time:
+                current_hour = time.localtime(current_time).tm_hour
+
+                # If it's the sync hour, we haven't synced in the last 12 hours, and we aren't in a retry timeout
+                if (
+                    current_hour == sync_hour
+                    and (current_time - last_sync_time) > 43200
+                    and current_time >= next_retry_time
+                ):
                     click.echo(f"[{time.strftime('%H:%M:%S')}] Syncing Jira...")
                     if fetch_and_store_jira_tasks(db, jira_url, jira_token):
                         click.secho("Done.", fg="green")
+                        last_sync_time = time.time()
                     else:
-                        next_retry_time = now + retry_delay
+                        next_retry_time = current_time + retry_delay
                         click.secho(f"Failed. Retry in {retry_delay // 60}m.", fg="red")
 
             except Exception as e:
-                # Catch-all prevents database locks or network issues from killing the tracker
                 logger.error(f"Error in main loop: {e}", exc_info=True)
 
-            # Sleep at the end of the loop
-            time.sleep(interval)
+            elapsed_time = time.time() - loop_start_time
+            sleep_time = max(0.0, interval - elapsed_time)
+            time.sleep(sleep_time)
 
     except KeyboardInterrupt:
         click.secho("\nStopped by user.", fg="yellow")
